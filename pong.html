@@ -8,7 +8,7 @@
   :root {
     --fg: #e8e8e8;
     --bg: #0a0a0a;
-    --accent: #4ade80;
+    --accent: #f87171;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -60,7 +60,7 @@
   <canvas id="game" width="800" height="500"></canvas>
   <p class="hint">
     <kbd>W</kbd> / <kbd>S</kbd> or <kbd>&uarr;</kbd> / <kbd>&darr;</kbd> to move &nbsp;&middot;&nbsp;
-    <kbd>Space</kbd> to pause &nbsp;&middot;&nbsp; first to 11 wins
+    <kbd>Space</kbd> to pause &nbsp;&middot;&nbsp; you cannot win
   </p>
 
 <script>
@@ -75,37 +75,45 @@
   const PADDLE_MARGIN = 24;
   const BALL_SIZE = 12;
   const PLAYER_SPEED = 6;
-  const AI_SPEED = 4.5;
-  const WIN_SCORE = 11;
+  const AI_SPEED = 16;          // fast enough to always arrive first
+  const LOSE_SCORE = 11;        // the bot always gets here; you never do
 
-  const player = { x: PADDLE_MARGIN, y: H / 2 - PADDLE_H / 2, score: 0 };
-  const ai = { x: W - PADDLE_MARGIN - PADDLE_W, y: H / 2 - PADDLE_H / 2, score: 0 };
+  const player = { x: PADDLE_MARGIN, y: H / 2 - PADDLE_H / 2 };
+  const ai = { x: W - PADDLE_MARGIN - PADDLE_W, y: H / 2 - PADDLE_H / 2 };
   const ball = { x: 0, y: 0, vx: 0, vy: 0 };
 
   const keys = new Set();
   let paused = false;
-  let winner = null;
+  let over = false;
+  let cpuScore = 0;
+  let pointSpeed = 6;   // ramps up every point so it gets worse, never better
+  let rally = 0;        // paddle touches in the current point
+  let longestRally = 0; // the only number you can move
 
-  function resetBall(dir) {
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function serve() {
     ball.x = W / 2 - BALL_SIZE / 2;
     ball.y = H / 2 - BALL_SIZE / 2;
-    const angle = (Math.random() * 0.6 - 0.3); // -0.3..0.3 rad
-    const speed = 5;
-    ball.vx = Math.cos(angle) * speed * dir;
-    ball.vy = Math.sin(angle) * speed;
+    pointSpeed = 6;
+    rally = 0;
+    // Always served toward the player, gently, so they get one honest touch.
+    const angle = (Math.random() * 0.5 - 0.25);
+    ball.vx = -Math.cos(angle) * pointSpeed;
+    ball.vy = Math.sin(angle) * pointSpeed;
   }
 
   function resetGame() {
-    player.score = 0;
-    ai.score = 0;
-    winner = null;
-    resetBall(Math.random() < 0.5 ? -1 : 1);
+    cpuScore = 0;
+    longestRally = 0;
+    over = false;
+    serve();
   }
 
   document.addEventListener("keydown", (e) => {
     if (e.code === "Space") {
       e.preventDefault();
-      if (winner) { resetGame(); return; }
+      if (over) { resetGame(); return; }
       paused = !paused;
       return;
     }
@@ -113,7 +121,6 @@
   });
   document.addEventListener("keyup", (e) => keys.delete(e.code));
 
-  // Touch / mouse drag control for the player paddle
   function pointerMove(clientY) {
     const rect = canvas.getBoundingClientRect();
     const scale = H / rect.height;
@@ -126,37 +133,47 @@
     pointerMove(e.touches[0].clientY);
   }, { passive: false });
 
-  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  // Where the ball will cross the bot's plane, accounting for wall bounces.
+  function predictBotY() {
+    if (ball.vx <= 0) return H / 2 - PADDLE_H / 2;
+    const frames = (ai.x - ball.x) / ball.vx;
+    const span = 2 * (H - BALL_SIZE);
+    let y = (((ball.y + ball.vy * frames) % span) + span) % span;
+    if (y > H - BALL_SIZE) y = span - y;
+    return y + BALL_SIZE / 2 - PADDLE_H / 2;
+  }
 
   function update() {
-    if (paused || winner) return;
+    if (paused || over) return;
 
-    // Player movement
     if (keys.has("KeyW") || keys.has("ArrowUp")) player.y -= PLAYER_SPEED;
     if (keys.has("KeyS") || keys.has("ArrowDown")) player.y += PLAYER_SPEED;
     player.y = clamp(player.y, 0, H - PADDLE_H);
 
-    // AI tracks the ball with a capped speed and a small dead zone
-    const aiCenter = ai.y + PADDLE_H / 2;
-    const diff = ball.y + BALL_SIZE / 2 - aiCenter;
-    if (Math.abs(diff) > 8) ai.y += clamp(diff, -AI_SPEED, AI_SPEED);
-    ai.y = clamp(ai.y, 0, H - PADDLE_H);
+    // The bot: knows exactly where the ball is going and gets there.
+    const target = ball.vx > 0 ? predictBotY() : H / 2 - PADDLE_H / 2;
+    ai.y = clamp(ai.y + clamp(target - ai.y, -AI_SPEED, AI_SPEED), 0, H - PADDLE_H);
 
-    // Ball movement
     ball.x += ball.vx;
     ball.y += ball.vy;
 
-    // Top / bottom walls
     if (ball.y <= 0) { ball.y = 0; ball.vy *= -1; }
     if (ball.y + BALL_SIZE >= H) { ball.y = H - BALL_SIZE; ball.vy *= -1; }
 
-    // Paddle collisions
-    if (hit(player)) bounce(player, 1);
-    if (hit(ai)) bounce(ai, -1);
+    if (hit(player)) playerBounce();
+    if (hit(ai)) botBounce();
 
-    // Scoring
-    if (ball.x + BALL_SIZE < 0) { ai.score++; checkWin(); resetBall(1); }
-    if (ball.x > W) { player.score++; checkWin(); resetBall(-1); }
+    // Player misses -> bot scores. (The ball never gets past the bot.)
+    if (ball.x + BALL_SIZE < 0) {
+      cpuScore++;
+      longestRally = Math.max(longestRally, rally);
+      if (cpuScore >= LOSE_SCORE) { over = true; longestRally = Math.max(longestRally, rally); }
+      else serve();
+    }
+    if (ball.x > W) {
+      // Should never happen, but if it somehow does, the bot just re-serves.
+      serve();
+    }
   }
 
   function hit(p) {
@@ -166,52 +183,67 @@
            ball.y + BALL_SIZE > p.y;
   }
 
-  function bounce(p, dir) {
-    // Reflect and add spin based on where the ball struck the paddle
-    const rel = (ball.y + BALL_SIZE / 2 - (p.y + PADDLE_H / 2)) / (PADDLE_H / 2);
-    const speed = Math.min(Math.hypot(ball.vx, ball.vy) * 1.05, 14);
-    const angle = rel * (Math.PI / 4); // up to 45 degrees
-    ball.vx = Math.cos(angle) * speed * dir;
+  // Player's return: an honest reflection with spin off the paddle.
+  function playerBounce() {
+    rally++;
+    const rel = (ball.y + BALL_SIZE / 2 - (player.y + PADDLE_H / 2)) / (PADDLE_H / 2);
+    const speed = Math.min(Math.hypot(ball.vx, ball.vy) * 1.05, 15);
+    const angle = rel * (Math.PI / 4);
+    ball.vx = Math.abs(Math.cos(angle) * speed);
     ball.vy = Math.sin(angle) * speed;
-    ball.x = dir === 1 ? p.x + PADDLE_W : p.x - BALL_SIZE;
+    ball.x = player.x + PADDLE_W;
   }
 
-  function checkWin() {
-    if (player.score >= WIN_SCORE) winner = "PLAYER";
-    else if (ai.score >= WIN_SCORE) winner = "CPU";
+  // Bot's return: faster every touch, aimed at the corner you're farthest from.
+  function botBounce() {
+    rally++;
+    pointSpeed = Math.min(pointSpeed + 1.5, 20);
+    const playerCenter = player.y + PADDLE_H / 2;
+    const targetY = playerCenter < H / 2 ? (H - BALL_SIZE - 8) : 8;
+    const dist = ball.x - (player.x + PADDLE_W);
+    const frames = Math.max(dist / pointSpeed, 1);
+    ball.vx = -pointSpeed;
+    ball.vy = clamp((targetY - ball.y) / frames, -18, 18);
+    ball.x = ai.x - BALL_SIZE;
   }
 
   function draw() {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, W, H);
 
-    // Center net
     ctx.fillStyle = "#222";
     for (let y = 0; y < H; y += 24) ctx.fillRect(W / 2 - 1, y, 2, 14);
 
-    // Paddles + ball
     ctx.fillStyle = "#e8e8e8";
     ctx.fillRect(player.x, player.y, PADDLE_W, PADDLE_H);
     ctx.fillRect(ai.x, ai.y, PADDLE_W, PADDLE_H);
     ctx.fillRect(ball.x, ball.y, BALL_SIZE, BALL_SIZE);
 
-    // Scores
     ctx.font = "42px 'SF Mono', ui-monospace, Menlo, monospace";
     ctx.textAlign = "center";
-    ctx.fillText(player.score, W / 2 - 60, 56);
-    ctx.fillText(ai.score, W / 2 + 60, 56);
+    ctx.fillStyle = "#555";
+    ctx.fillText("0", W / 2 - 60, 56);
+    ctx.fillStyle = "#e8e8e8";
+    ctx.fillText(cpuScore, W / 2 + 60, 56);
 
-    if (paused && !winner) banner("PAUSED");
-    if (winner) banner(winner + " WINS  —  SPACE TO RESTART");
+    ctx.font = "11px 'SF Mono', ui-monospace, Menlo, monospace";
+    ctx.fillStyle = "#666";
+    ctx.fillText("YOU", W / 2 - 60, 74);
+    ctx.fillText("CPU", W / 2 + 60, 74);
+    ctx.textAlign = "left";
+    ctx.fillText("LONGEST RALLY  " + longestRally, 16, H - 14);
+
+    if (paused && !over) banner("PAUSED");
+    if (over) banner("CPU WINS " + cpuScore + "-0  —  SPACE TO TRY AGAIN");
   }
 
   function banner(text) {
-    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillStyle = "rgba(0,0,0,0.65)";
     ctx.fillRect(0, H / 2 - 30, W, 60);
-    ctx.fillStyle = "#4ade80";
-    ctx.font = "20px 'SF Mono', ui-monospace, Menlo, monospace";
+    ctx.fillStyle = "#f87171";
+    ctx.font = "18px 'SF Mono', ui-monospace, Menlo, monospace";
     ctx.textAlign = "center";
-    ctx.fillText(text, W / 2, H / 2 + 7);
+    ctx.fillText(text, W / 2, H / 2 + 6);
   }
 
   function loop() {
@@ -220,7 +252,7 @@
     requestAnimationFrame(loop);
   }
 
-  resetBall(Math.random() < 0.5 ? -1 : 1);
+  serve();
   loop();
 })();
 </script>
