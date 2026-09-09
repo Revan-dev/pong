@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pong</title>
+<style>
+  :root {
+    --fg: #e8e8e8;
+    --bg: #0a0a0a;
+    --accent: #4ade80;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 24px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 18px;
+    letter-spacing: 6px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  canvas {
+    background: #000;
+    border: 1px solid #222;
+    max-width: 100%;
+    height: auto;
+    touch-action: none;
+  }
+  .hint {
+    font-size: 12px;
+    color: #888;
+    text-align: center;
+    line-height: 1.6;
+  }
+  kbd {
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 3px;
+    padding: 1px 6px;
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+  <h1>PONG</h1>
+  <canvas id="game" width="800" height="500"></canvas>
+  <p class="hint">
+    <kbd>W</kbd> / <kbd>S</kbd> or <kbd>&uarr;</kbd> / <kbd>&darr;</kbd> to move &nbsp;&middot;&nbsp;
+    <kbd>Space</kbd> to pause &nbsp;&middot;&nbsp; first to 11 wins
+  </p>
+
+<script>
+(() => {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width;
+  const H = canvas.height;
+
+  const PADDLE_W = 12;
+  const PADDLE_H = 80;
+  const PADDLE_MARGIN = 24;
+  const BALL_SIZE = 12;
+  const PLAYER_SPEED = 6;
+  const AI_SPEED = 4.5;
+  const WIN_SCORE = 11;
+
+  const player = { x: PADDLE_MARGIN, y: H / 2 - PADDLE_H / 2, score: 0 };
+  const ai = { x: W - PADDLE_MARGIN - PADDLE_W, y: H / 2 - PADDLE_H / 2, score: 0 };
+  const ball = { x: 0, y: 0, vx: 0, vy: 0 };
+
+  const keys = new Set();
+  let paused = false;
+  let winner = null;
+
+  function resetBall(dir) {
+    ball.x = W / 2 - BALL_SIZE / 2;
+    ball.y = H / 2 - BALL_SIZE / 2;
+    const angle = (Math.random() * 0.6 - 0.3); // -0.3..0.3 rad
+    const speed = 5;
+    ball.vx = Math.cos(angle) * speed * dir;
+    ball.vy = Math.sin(angle) * speed;
+  }
+
+  function resetGame() {
+    player.score = 0;
+    ai.score = 0;
+    winner = null;
+    resetBall(Math.random() < 0.5 ? -1 : 1);
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (winner) { resetGame(); return; }
+      paused = !paused;
+      return;
+    }
+    keys.add(e.code);
+  });
+  document.addEventListener("keyup", (e) => keys.delete(e.code));
+
+  // Touch / mouse drag control for the player paddle
+  function pointerMove(clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const scale = H / rect.height;
+    const y = (clientY - rect.top) * scale;
+    player.y = clamp(y - PADDLE_H / 2, 0, H - PADDLE_H);
+  }
+  canvas.addEventListener("mousemove", (e) => pointerMove(e.clientY));
+  canvas.addEventListener("touchmove", (e) => {
+    e.preventDefault();
+    pointerMove(e.touches[0].clientY);
+  }, { passive: false });
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function update() {
+    if (paused || winner) return;
+
+    // Player movement
+    if (keys.has("KeyW") || keys.has("ArrowUp")) player.y -= PLAYER_SPEED;
+    if (keys.has("KeyS") || keys.has("ArrowDown")) player.y += PLAYER_SPEED;
+    player.y = clamp(player.y, 0, H - PADDLE_H);
+
+    // AI tracks the ball with a capped speed and a small dead zone
+    const aiCenter = ai.y + PADDLE_H / 2;
+    const diff = ball.y + BALL_SIZE / 2 - aiCenter;
+    if (Math.abs(diff) > 8) ai.y += clamp(diff, -AI_SPEED, AI_SPEED);
+    ai.y = clamp(ai.y, 0, H - PADDLE_H);
+
+    // Ball movement
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // Top / bottom walls
+    if (ball.y <= 0) { ball.y = 0; ball.vy *= -1; }
+    if (ball.y + BALL_SIZE >= H) { ball.y = H - BALL_SIZE; ball.vy *= -1; }
+
+    // Paddle collisions
+    if (hit(player)) bounce(player, 1);
+    if (hit(ai)) bounce(ai, -1);
+
+    // Scoring
+    if (ball.x + BALL_SIZE < 0) { ai.score++; checkWin(); resetBall(1); }
+    if (ball.x > W) { player.score++; checkWin(); resetBall(-1); }
+  }
+
+  function hit(p) {
+    return ball.x < p.x + PADDLE_W &&
+           ball.x + BALL_SIZE > p.x &&
+           ball.y < p.y + PADDLE_H &&
+           ball.y + BALL_SIZE > p.y;
+  }
+
+  function bounce(p, dir) {
+    // Reflect and add spin based on where the ball struck the paddle
+    const rel = (ball.y + BALL_SIZE / 2 - (p.y + PADDLE_H / 2)) / (PADDLE_H / 2);
+    const speed = Math.min(Math.hypot(ball.vx, ball.vy) * 1.05, 14);
+    const angle = rel * (Math.PI / 4); // up to 45 degrees
+    ball.vx = Math.cos(angle) * speed * dir;
+    ball.vy = Math.sin(angle) * speed;
+    ball.x = dir === 1 ? p.x + PADDLE_W : p.x - BALL_SIZE;
+  }
+
+  function checkWin() {
+    if (player.score >= WIN_SCORE) winner = "PLAYER";
+    else if (ai.score >= WIN_SCORE) winner = "CPU";
+  }
+
+  function draw() {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    // Center net
+    ctx.fillStyle = "#222";
+    for (let y = 0; y < H; y += 24) ctx.fillRect(W / 2 - 1, y, 2, 14);
+
+    // Paddles + ball
+    ctx.fillStyle = "#e8e8e8";
+    ctx.fillRect(player.x, player.y, PADDLE_W, PADDLE_H);
+    ctx.fillRect(ai.x, ai.y, PADDLE_W, PADDLE_H);
+    ctx.fillRect(ball.x, ball.y, BALL_SIZE, BALL_SIZE);
+
+    // Scores
+    ctx.font = "42px 'SF Mono', ui-monospace, Menlo, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(player.score, W / 2 - 60, 56);
+    ctx.fillText(ai.score, W / 2 + 60, 56);
+
+    if (paused && !winner) banner("PAUSED");
+    if (winner) banner(winner + " WINS  —  SPACE TO RESTART");
+  }
+
+  function banner(text) {
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, H / 2 - 30, W, 60);
+    ctx.fillStyle = "#4ade80";
+    ctx.font = "20px 'SF Mono', ui-monospace, Menlo, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(text, W / 2, H / 2 + 7);
+  }
+
+  function loop() {
+    update();
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  resetBall(Math.random() < 0.5 ? -1 : 1);
+  loop();
+})();
+</script>
+</body>
+</html>
