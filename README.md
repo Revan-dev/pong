@@ -1,27 +1,34 @@
-# Pong
+# Arcade
 
-A minimal single-file Pong game. Open `pong.html` in a browser — no build, no dependencies.
+Single-file browser games — no build, no dependencies. Open the `.html` file in a browser.
 
-The catch: you are playing an overpowered bot that **cannot be beaten**. It knows
-exactly where the ball is going, always gets there, and returns every shot to the
-corner you are farthest from — a little faster each touch. The score only moves in
-one direction.
+## `flappy.html` — Flappy Bird remake (in progress)
 
-## Controls
+The current focus. A bird, gravity, and a tap to flap; dodge the pipes, ride the
+scrolling ground platform, don't touch anything.
 
-- `W` / `S` or `↑` / `↓` — move your paddle (left side)
-- Mouse / touch drag also moves your paddle
-- `Space` — pause / resume, or restart after the loss
-- CPU wins at 11. You stay at 0.
+Controls: `Space` / `↑` / click / tap to flap. Best score is saved locally.
 
-The only number you can actually change is **LONGEST RALLY** — how many times you
-kept the ball alive in a single point.
+Built so far:
 
-## Roadmap
+- Bird physics (gravity + flap impulse) with tilt
+- Scrolling **ground platform** and parallax hills
+- Procedurally spawned pipe pairs, collision, scoring
+- Ready / play / game-over states, hit flash, best-score persistence
 
-This is an early draft. Planned additions:
+Next:
 
-- Escalating taunts as the score climbs
-- Sound effects
-- Persist the best rally between sessions
-- Increasingly absurd bot behavior
+- Sprites and polish pass on the frontend
+- Sound
+- Difficulty ramp (gap shrink / speed up)
+- Medals on the game-over panel
+
+## `pong.html` — unbeatable Pong
+
+You play an overpowered bot that **cannot be beaten**. It knows exactly where the
+ball is going, always gets there, and returns every shot to the corner you are
+farthest from — a little faster each touch.
+
+Controls: `W` / `S` or `↑` / `↓` (or mouse / touch) to move; `Space` to pause or
+restart. CPU wins at 11; you stay at 0. The only number you can move is
+**LONGEST RALLY**.
