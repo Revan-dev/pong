@@ -1,0 +1,777 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fighter</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background: #101018;
+    color: #e8e8e8;
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 16px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 15px;
+    letter-spacing: 6px;
+    color: #8ab4ff;
+  }
+  canvas {
+    background: #0a0a12;
+    border: 1px solid #222;
+    border-radius: 6px;
+    max-width: 100%;
+    height: auto;
+  }
+  .hint { font-size: 11px; color: #888; text-align: center; line-height: 1.7; max-width: 900px; }
+  kbd { background: #22222c; border: 1px solid #33333e; border-radius: 3px; padding: 1px 5px; font-size: 10px; }
+</style>
+</head>
+<body>
+  <h1>FIGHTER</h1>
+  <canvas id="game" width="900" height="540"></canvas>
+  <p class="hint">
+    <b>P1</b> <kbd>A</kbd><kbd>D</kbd> move &middot; <kbd>W</kbd> jump &middot; <kbd>S</kbd> drop &middot;
+    <kbd>F</kbd> attack &middot; <kbd>G</kbd> cast &middot; <kbd>T</kbd> cycle spell &nbsp;|&nbsp;
+    <b>P2</b> <kbd>&larr;</kbd><kbd>&rarr;</kbd> <kbd>&uarr;</kbd> <kbd>&darr;</kbd> &middot;
+    <kbd>.</kbd> attack &middot; <kbd>/</kbd> cast &middot; <kbd>,</kbd> cycle &nbsp;|&nbsp;
+    double-tap a direction to sprint
+  </p>
+
+<script>
+(() => {
+  const cv = document.getElementById("game");
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+
+  // ---------- constants ----------
+  const GRAVITY = 0.62;
+  const MAX_FALL = 16;
+  const GROUND_FRICTION = 0.80;
+  const AIR_FRICTION = 0.94;
+  const RESPAWN_INVULN = 110;
+
+  const STAGE = [
+    { x: 170, y: 410, w: 560, h: 22 },   // main
+    { x: 250, y: 300, w: 130, h: 12 },   // left float
+    { x: 520, y: 300, w: 130, h: 12 },   // right float
+  ];
+
+  const SPELLS = [
+    { name: "FIREBALL",  cost: 25, cd: 45,  color: "#ff7a2f" },
+    { name: "MISSILES",  cost: 30, cd: 90,  color: "#c98bff" },
+    { name: "SHIELD",    cost: 15, cd: 30,  color: "#57d0ff" },
+  ];
+
+  const CHARS = {
+    Mario: { color: "#e5322e", trim: "#3160a8", speed: 3.1, jump: 12.6, weight: 1.00, atk: 1.00, reach: 26, magic: 1.00, friction: 1.00 },
+    Luigi: { color: "#37a83b", trim: "#3160a8", speed: 3.0, jump: 13.8, weight: 0.90, atk: 0.95, reach: 26, magic: 1.05, friction: 0.55 },
+    Zelda: { color: "#ecd9c2", trim: "#d94f9c", speed: 2.7, jump: 11.6, weight: 0.95, atk: 0.78, reach: 24, magic: 1.45, friction: 1.00 },
+    Link:  { color: "#4c7a2f", trim: "#7a5230", speed: 3.0, jump: 12.1, weight: 1.12, atk: 1.10, reach: 42, magic: 1.10, friction: 1.05 },
+  };
+  const NAMES = Object.keys(CHARS);
+
+  // ---------- input ----------
+  const down = new Set();
+  let justPressed = new Set();
+  const tapLog = {}; // key -> last press frame, for double-tap sprint
+  let frame = 0;
+
+  const P1_KEYS = { left: "KeyA", right: "KeyD", jump: "KeyW", drop: "KeyS", atk: "KeyF", cast: "KeyG", cycle: "KeyT" };
+  const P2_KEYS = { left: "ArrowLeft", right: "ArrowRight", jump: "ArrowUp", drop: "ArrowDown", atk: "Period", cast: "Slash", cycle: "Comma" };
+  const PREVENT = new Set(Object.values(P1_KEYS).concat(Object.values(P2_KEYS)).concat(["Space"]));
+
+  window.addEventListener("keydown", (e) => {
+    if (PREVENT.has(e.code)) e.preventDefault();
+    if (!down.has(e.code)) {
+      // record fresh press for double-tap + edge-triggered actions
+      justPressed.add(e.code);
+      if (e.code === P1_KEYS.left || e.code === P1_KEYS.right || e.code === P2_KEYS.left || e.code === P2_KEYS.right) {
+        tapLog[e.code + "_prev"] = tapLog[e.code] ?? -999;
+        tapLog[e.code] = frame;
+      }
+    }
+    down.add(e.code);
+    if (state === "title") state = "mode";
+    else if (state === "result" && frame - resultAt > 20) resetToTitle();
+  });
+  window.addEventListener("keyup", (e) => down.delete(e.code));
+
+  // ---------- game state ----------
+  let state = "title";       // title | mode | select | fight | result
+  let vsCPU = true;
+  let fighters = [];
+  let projectiles = [];
+  let particles = [];
+  let selectIdx = [0, 1];
+  let selectLocked = [false, false];
+  let winner = -1;
+  let resultAt = 0;
+  let shakeT = 0;
+
+  function resetToTitle() {
+    state = "title";
+    fighters = []; projectiles = []; particles = [];
+    selectIdx = [0, 1]; selectLocked = [false, false];
+  }
+
+  function makeFighter(name, idx, isCPU) {
+    const c = CHARS[name];
+    return {
+      name, idx, isCPU,
+      x: idx === 0 ? 340 : 560, y: 200,
+      vx: 0, vy: 0, w: 30, h: 46,
+      facing: idx === 0 ? 1 : -1,
+      onGround: false, jumps: 2,
+      damage: 0, stocks: 3,
+      hitstun: 0, hitlag: 0,
+      atkTimer: 0, atkKind: null, atkHasHit: false,
+      combo: 0, comboWindow: 0,
+      mana: 100, manaMax: 100,
+      spell: 0, cd: [0, 0, 0],
+      shield: false, shieldCd: 0,
+      invuln: RESPAWN_INVULN, respawn: 0,
+      dropTimer: 0,
+      sprint: false,
+      aiTimer: 0, aiIntent: null,
+      keys: idx === 0 ? P1_KEYS : P2_KEYS,
+      stats: c,
+    };
+  }
+
+  function startFight() {
+    fighters = [
+      makeFighter(NAMES[selectIdx[0]], 0, false),
+      makeFighter(NAMES[selectIdx[1]], 1, vsCPU),
+    ];
+    projectiles = []; particles = [];
+    state = "fight";
+  }
+
+  // ---------- helpers ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+  function spawnParticles(x, y, color, n) {
+    for (let i = 0; i < n; i++) {
+      particles.push({
+        x, y,
+        vx: (Math.random() - 0.5) * 6,
+        vy: (Math.random() - 0.5) * 6 - 1,
+        life: 18 + Math.random() * 12, color,
+      });
+    }
+  }
+
+  // ---------- combat ----------
+  function attackBox(f) {
+    const kind = f.atkKind;
+    const forward = f.facing;
+    if (kind === "up") {
+      return { x: f.x - 6, y: f.y - 30, w: f.w + 12, h: 34, dmg: 5, kbx: 2 * forward, kby: -11, launch: true };
+    }
+    if (kind === "dash") {
+      return { x: f.x + (forward > 0 ? f.w : -f.stats.reach), y: f.y + 4, w: f.stats.reach, h: f.h - 8,
+               dmg: 8, kbx: 9 * forward, kby: -5, launch: false };
+    }
+    // neutral / combo
+    const isLauncher = f.combo >= 2;
+    return {
+      x: f.x + (forward > 0 ? f.w : -f.stats.reach), y: f.y + 8,
+      w: f.stats.reach, h: f.h - 16,
+      dmg: isLauncher ? 6 : 3,
+      kbx: (isLauncher ? 7 : 3) * forward,
+      kby: isLauncher ? -9 : -3,
+      launch: isLauncher,
+    };
+  }
+
+  function tryAttack(f, kind) {
+    if (f.atkTimer > 0 || f.hitstun > 0 || f.shield) return;
+    if (kind === "neutral" && f.comboWindow > 0 && f.combo < 3) f.combo++;
+    else if (kind === "neutral") f.combo = 1;
+    else f.combo = 0;
+    f.atkKind = kind;
+    f.atkTimer = kind === "dash" ? 22 : 16;
+    f.atkHasHit = false;
+  }
+
+  function castSpell(f) {
+    const s = SPELLS[f.spell];
+    if (f.cd[f.spell] > 0 || f.hitstun > 0) return;
+    if (f.spell === 2) { // shield toggle
+      if (f.shieldCd > 0) return;
+      f.shield = !f.shield;
+      if (!f.shield) f.shieldCd = s.cd;
+      else if (f.mana < s.cost) { f.shield = false; return; }
+      else f.mana -= s.cost;
+      return;
+    }
+    if (f.mana < s.cost) return;
+    f.mana -= s.cost;
+    f.cd[f.spell] = s.cd;
+    const m = f.stats.magic;
+    if (f.spell === 0) {
+      projectiles.push({ kind: "fire", owner: f.idx, x: f.x + f.w / 2, y: f.y + 14,
+        vx: 7.4 * f.facing, vy: -2.2, g: 0.22, r: 9, life: 150,
+        dmg: 9 * m, kbx: 8 * f.facing, kby: -7 });
+    } else {
+      for (let i = 0; i < 3; i++) {
+        projectiles.push({ kind: "missile", owner: f.idx, x: f.x + f.w / 2, y: f.y + 10 + i * 6,
+          vx: 4 * f.facing, vy: (i - 1) * 2, g: 0, r: 5, life: 110, homing: 0.22,
+          dmg: 4 * m, kbx: 3 * f.facing, kby: -3 });
+      }
+    }
+    spawnParticles(f.x + f.w / 2, f.y + 12, s.color, 8);
+  }
+
+  function applyHit(att, def, box) {
+    if (def.invuln > 0 || def.respawn > 0) return;
+    if (def.shield) { // shield absorbs, small push, chip mana
+      def.mana = Math.max(0, def.mana - 6);
+      def.vx += Math.sign(box.kbx) * 1.5;
+      spawnParticles(def.x + def.w / 2, def.y + def.h / 2, "#57d0ff", 6);
+      if (def.mana <= 0) { def.shield = false; def.shieldCd = SPELLS[2].cd; }
+      att.atkHasHit = true;
+      return;
+    }
+    def.damage += box.dmg;
+    const scale = (1 + def.damage / 55) / def.stats.weight;
+    def.vx = box.kbx * scale;
+    def.vy = box.kby * scale - (box.launch ? 2 : 0);
+    def.hitstun = Math.round(10 + box.dmg * 1.6 * scale);
+    def.combo = 0; def.atkTimer = 0; def.shield = false;
+    att.atkHasHit = true;
+    att.hitlag = 6; def.hitlag = 6;
+    shakeT = Math.max(shakeT, box.launch ? 10 : 5);
+    spawnParticles(def.x + def.w / 2, def.y + def.h / 2, "#ffd54a", box.launch ? 16 : 9);
+  }
+
+  // ---------- update ----------
+  function platformUnder(f, prevBottom) {
+    const bottom = f.y + f.h;
+    for (const p of STAGE) {
+      if (f.vy >= 0 && prevBottom <= p.y && bottom >= p.y &&
+          f.x + f.w > p.x + 3 && f.x < p.x + p.w - 3) {
+        return p;
+      }
+    }
+    return null;
+  }
+
+  function doubleTapped(key) {
+    const last = tapLog[key] ?? -999;
+    const prev = tapLog[key + "_prev"] ?? -999;
+    return last - prev > 0 && last - prev < 16 && frame - last < 3;
+  }
+
+  function readIntent(f) {
+    if (!f.isCPU) {
+      const k = f.keys;
+      return {
+        left: down.has(k.left), right: down.has(k.right),
+        jump: justPressed.has(k.jump), jumpHeld: down.has(k.jump),
+        drop: down.has(k.drop),
+        atk: justPressed.has(k.atk),
+        cast: justPressed.has(k.cast),
+        cycle: justPressed.has(k.cycle),
+        up: down.has(k.jump),
+        sprint: doubleTapped(k.left) || doubleTapped(k.right),
+      };
+    }
+    // ---- CPU ----
+    const foe = fighters[1 - f.idx];
+    const dx = (foe.x + foe.w / 2) - (f.x + f.w / 2);
+    const dy = (foe.y) - (f.y);
+    const adx = Math.abs(dx);
+    const it = { left: false, right: false, jump: false, jumpHeld: false, drop: false,
+                 atk: false, cast: false, cycle: false, up: false, sprint: false };
+    f.aiTimer--;
+    // recover if off stage
+    const offStage = f.x + f.w < STAGE[0].x || f.x > STAGE[0].x + STAGE[0].w;
+    if (offStage && f.y + f.h > STAGE[0].y - 10) {
+      if (dx > 0) it.right = true; else it.left = true;
+      if (f.vy > -2 && f.jumps > 0 && frame % 12 === 0) it.jump = true;
+      return it;
+    }
+    // approach
+    if (adx > 70) {
+      if (dx > 0) it.right = true; else it.left = true;
+      if (adx > 220 && f.onGround) it.sprint = true;
+      // chase vertically: jump toward a foe above, drop toward a foe below
+      if (dy < -50) {
+        if (f.onGround) it.jump = true;
+        else if (f.jumps > 0 && f.vy > -1 && frame % 10 === 0) it.jump = true;
+      } else if (dy > 70 && f.onGround && adx < 160 && frame % 24 === 0) {
+        it.drop = true;
+      }
+    } else {
+      // in range: poke
+      if (f.aiTimer <= 0) {
+        const roll = Math.random();
+        if (roll < 0.5) it.atk = true;
+        else if (roll < 0.62) { it.atk = true; it.up = true; }
+        else if (roll < 0.78 && f.mana > SPELLS[f.spell].cost) it.cast = true;
+        f.aiTimer = 14 + Math.floor(Math.random() * 20);
+      }
+      if (foe.x < f.x) f.facing = -1; else f.facing = 1;
+    }
+    // block incoming fireballs: is a foe projectile close and heading at us?
+    for (const pr of projectiles) {
+      if (pr.owner === f.idx) continue;
+      const closing = Math.abs(pr.x - (f.x + f.w / 2)) < 110 && Math.sign(pr.vx) === Math.sign((f.x + f.w / 2) - pr.x);
+      if (closing) {
+        if (f.spell !== 2 && Math.random() < 0.08) it.cycle = true;
+        if (f.spell === 2 && Math.random() < 0.35) it.cast = true;
+      }
+    }
+    return it;
+  }
+
+  function updateFighter(f) {
+    if (f.hitlag > 0) { f.hitlag--; return; }
+
+    if (f.respawn > 0) {
+      f.respawn--;
+      f.x = 435; f.y = -20 + (110 - f.respawn) * 0.9;
+      f.vx = 0; f.vy = 0;
+      if (f.respawn === 0) { f.y = 120; f.invuln = RESPAWN_INVULN; }
+      return;
+    }
+
+    const it = readIntent(f);
+    const s = f.stats;
+
+    if (f.invuln > 0) f.invuln--;
+    if (f.comboWindow > 0) f.comboWindow--;
+    for (let i = 0; i < 3; i++) if (f.cd[i] > 0) f.cd[i]--;
+    if (f.shieldCd > 0) f.shieldCd--;
+
+    // mana regen
+    const regen = 0.28 * (f.name === "Zelda" ? 1.7 : 1) * (f.shield ? 0 : 1);
+    f.mana = clamp(f.mana + regen, 0, f.manaMax);
+    if (f.shield) {
+      f.mana -= 0.45;
+      if (f.mana <= 0) { f.shield = false; f.mana = 0; f.shieldCd = SPELLS[2].cd; }
+    }
+
+    // sprint state
+    if (it.sprint && f.onGround) f.sprint = true;
+    if (!it.left && !it.right) f.sprint = false;
+
+    // horizontal move
+    const canAct = f.hitstun <= 0 && f.atkTimer <= 0;
+    let moveSpeed = s.speed * (f.sprint ? 1.8 : 1) * (f.shield ? 0.35 : 1);
+    if (f.hitstun > 0) {
+      f.hitstun--;
+    } else {
+      if (it.left) { f.vx += (f.onGround ? -0.7 : -0.35); if (canAct && !f.shield) f.facing = -1; }
+      if (it.right) { f.vx += (f.onGround ? 0.7 : 0.35); if (canAct && !f.shield) f.facing = 1; }
+      f.vx = clamp(f.vx, -moveSpeed, moveSpeed);
+      if (!it.left && !it.right) {
+        const fr = f.onGround ? GROUND_FRICTION * s.friction : AIR_FRICTION;
+        f.vx *= Math.min(fr, 0.99);
+        if (Math.abs(f.vx) < 0.05) f.vx = 0;
+      }
+    }
+
+    // jump
+    if (it.jump && f.jumps > 0 && f.hitstun <= 0) {
+      f.vy = -s.jump * (f.jumps === 2 ? 1 : 0.88);
+      f.jumps--;
+      f.onGround = false;
+      spawnParticles(f.x + f.w / 2, f.y + f.h, "#89909c", 5);
+    }
+    // fast-fall
+    if (it.drop && f.vy > 0 && !f.onGround) f.vy += 0.7;
+    if (it.drop && f.onGround) f.dropTimer = 10;
+    if (f.dropTimer > 0) f.dropTimer--;
+
+    // actions
+    if (it.cycle) f.spell = (f.spell + 1) % 3;
+    if (it.cast) castSpell(f);
+    if (it.atk && f.hitstun <= 0) {
+      let kind = "neutral";
+      if (it.up) kind = "up";
+      else if (f.sprint && f.onGround) kind = "dash";
+      tryAttack(f, kind);
+    }
+
+    // gravity
+    f.vy = clamp(f.vy + GRAVITY, -99, MAX_FALL);
+
+    const prevBottom = f.y + f.h;
+    f.x += f.vx;
+    f.y += f.vy;
+
+    // platform landing
+    f.onGround = false;
+    if (f.dropTimer <= 0) {
+      const p = platformUnder(f, prevBottom);
+      if (p) {
+        f.y = p.y - f.h;
+        f.vy = 0;
+        f.onGround = true;
+        f.jumps = 2;
+        f.sprint = f.sprint && (it.left || it.right);
+      }
+    }
+
+    // attack timer -> combo window
+    if (f.atkTimer > 0) {
+      f.atkTimer--;
+      if (f.atkTimer === 0 && f.atkKind === "neutral") f.comboWindow = 16;
+      if (f.atkTimer === 0) f.atkKind = null;
+    }
+
+    // blast zone
+    if (state === "fight" && (f.x + f.w < -70 || f.x > W + 70 || f.y > H + 90 || f.y < -190)) {
+      f.stocks--;
+      spawnParticles(clamp(f.x, 10, W - 10), clamp(f.y, 10, H - 10), f.stats.color, 24);
+      shakeT = 16;
+      if (f.stocks <= 0) {
+        winner = 1 - f.idx;
+        state = "result";
+        resultAt = frame;
+      } else {
+        f.respawn = 110; f.damage = 0; f.combo = 0; f.hitstun = 0;
+        f.shield = false; f.vx = 0; f.vy = 0;
+      }
+    }
+  }
+
+  function updateProjectile(pr) {
+    pr.life--;
+    if (pr.kind === "missile" && pr.homing) {
+      const foe = fighters[1 - pr.owner];
+      if (foe && foe.respawn <= 0) {
+        const tx = foe.x + foe.w / 2, ty = foe.y + foe.h / 2;
+        const ang = Math.atan2(ty - pr.y, tx - pr.x);
+        const sp = Math.hypot(pr.vx, pr.vy) || 4;
+        pr.vx += Math.cos(ang) * pr.homing * 4;
+        pr.vy += Math.sin(ang) * pr.homing * 4;
+        const cur = Math.hypot(pr.vx, pr.vy);
+        const cap = 6;
+        if (cur > cap) { pr.vx = pr.vx / cur * cap; pr.vy = pr.vy / cur * cap; }
+      }
+    }
+    pr.vy += pr.g;
+    pr.x += pr.vx;
+    pr.y += pr.vy;
+
+    const foe = fighters[1 - pr.owner];
+    if (foe && rectsOverlap(pr.x - pr.r, pr.y - pr.r, pr.r * 2, pr.r * 2, foe.x, foe.y, foe.w, foe.h)) {
+      applyHit(fighters[pr.owner], foe, { dmg: pr.dmg, kbx: pr.kbx, kby: pr.kby, launch: pr.kind === "fire" });
+      spawnParticles(pr.x, pr.y, pr.kind === "fire" ? "#ff7a2f" : "#c98bff", 12);
+      pr.life = 0;
+    }
+    if (pr.x < -40 || pr.x > W + 40 || pr.y > H + 40) pr.life = 0;
+  }
+
+  function updateFight() {
+    for (const f of fighters) updateFighter(f);
+
+    // melee hit resolution
+    for (const f of fighters) {
+      if (f.atkTimer > 0 && !f.atkHasHit && f.hitlag <= 0) {
+        const box = attackBox(f);
+        const foe = fighters[1 - f.idx];
+        if (foe.respawn <= 0 && rectsOverlap(box.x, box.y, box.w, box.h, foe.x, foe.y, foe.w, foe.h)) {
+          applyHit(f, foe, box);
+        }
+      }
+    }
+
+    projectiles.forEach(updateProjectile);
+    projectiles = projectiles.filter((p) => p.life > 0);
+
+    particles.forEach((p) => { p.x += p.vx; p.y += p.vy; p.vy += 0.15; p.life--; });
+    particles = particles.filter((p) => p.life > 0);
+
+    if (shakeT > 0) shakeT--;
+  }
+
+  // ---------- drawing ----------
+  function drawStage() {
+    for (const p of STAGE) {
+      ctx.fillStyle = "#2a2f3e";
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = "#3d4457";
+      ctx.fillRect(p.x, p.y, p.w, 3);
+    }
+  }
+
+  function drawFighter(f) {
+    if (f.respawn > 0 && Math.floor(f.respawn / 4) % 2) { /* blink out */ }
+    const blink = f.invuln > 0 && Math.floor(frame / 4) % 2 === 0;
+    ctx.save();
+    ctx.globalAlpha = blink ? 0.35 : 1;
+
+    // body
+    ctx.fillStyle = f.stats.color;
+    ctx.fillRect(f.x, f.y, f.w, f.h);
+    // trim (legs / accent)
+    ctx.fillStyle = f.stats.trim;
+    ctx.fillRect(f.x, f.y + f.h - 16, f.w, 16);
+    // face direction marker
+    ctx.fillStyle = "#0a0a12";
+    ctx.fillRect(f.x + (f.facing > 0 ? f.w - 8 : 2), f.y + 8, 6, 6);
+
+    // sword for Link
+    if (f.name === "Link" && f.atkTimer > 0 && f.atkKind !== "up") {
+      ctx.fillStyle = "#dfe6f0";
+      const sx = f.facing > 0 ? f.x + f.w : f.x - f.stats.reach;
+      ctx.fillRect(sx, f.y + 14, f.stats.reach, 6);
+    }
+    // attack flash
+    if (f.atkTimer > 0) {
+      const box = attackBox(f);
+      ctx.fillStyle = "rgba(255,255,255,0.16)";
+      ctx.fillRect(box.x, box.y, box.w, box.h);
+    }
+    // shield bubble
+    if (f.shield) {
+      ctx.strokeStyle = "rgba(87,208,255,0.9)";
+      ctx.fillStyle = "rgba(87,208,255,0.14)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(f.x + f.w / 2, f.y + f.h / 2, f.w + 6, 0, Math.PI * 2);
+      ctx.fill(); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawProjectile(pr) {
+    ctx.fillStyle = pr.kind === "fire" ? "#ff7a2f" : "#c98bff";
+    ctx.beginPath();
+    ctx.arc(pr.x, pr.y, pr.r, 0, Math.PI * 2);
+    ctx.fill();
+    if (pr.kind === "fire") {
+      ctx.fillStyle = "rgba(255,213,74,0.5)";
+      ctx.beginPath();
+      ctx.arc(pr.x - pr.vx * 0.6, pr.y - pr.vy * 0.6, pr.r * 0.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawHUD() {
+    for (const f of fighters) {
+      const left = f.idx === 0;
+      const bx = left ? 24 : W - 24 - 180;
+      const by = H - 66;
+      ctx.textAlign = left ? "left" : "right";
+      const ax = left ? bx : bx + 180;
+
+      ctx.fillStyle = "#cfd6e4";
+      ctx.font = "12px 'SF Mono', ui-monospace, monospace";
+      ctx.fillText(f.name.toUpperCase() + (f.isCPU ? "  (CPU)" : ""), ax, by);
+
+      // stocks
+      for (let i = 0; i < f.stocks; i++) {
+        const sxp = left ? bx + i * 16 : bx + 180 - 12 - i * 16;
+        ctx.fillStyle = f.stats.color;
+        ctx.fillRect(sxp, by + 6, 11, 11);
+      }
+
+      // damage %
+      const d = Math.round(f.damage);
+      const t = clamp(d / 150, 0, 1);
+      const dc = `rgb(${Math.round(255)}, ${Math.round(255 - t * 170)}, ${Math.round(255 - t * 240)})`;
+      ctx.fillStyle = dc;
+      ctx.font = "bold 26px 'SF Mono', ui-monospace, monospace";
+      ctx.fillText(d + "%", ax, by + 44);
+
+      // mana bar
+      ctx.fillStyle = "#20222c";
+      ctx.fillRect(bx, by + 52, 180, 7);
+      ctx.fillStyle = "#57d0ff";
+      const mw = 180 * (f.mana / f.manaMax);
+      ctx.fillRect(left ? bx : bx + 180 - mw, by + 52, mw, 7);
+
+      // spell chips
+      for (let i = 0; i < 3; i++) {
+        const cw = 56, gap = 6;
+        const sxp = left ? bx + i * (cw + gap) : bx + 180 - cw - i * (cw + gap);
+        const sel = i === f.spell;
+        ctx.fillStyle = sel ? SPELLS[i].color : "#20222c";
+        ctx.fillRect(sxp, by + 64, cw, 14);
+        if (f.cd[i] > 0) {
+          ctx.fillStyle = "rgba(0,0,0,0.55)";
+          ctx.fillRect(sxp, by + 64, cw * (f.cd[i] / SPELLS[i].cd), 14);
+        }
+        ctx.fillStyle = sel ? "#0a0a12" : "#8a92a2";
+        ctx.font = "8px 'SF Mono', ui-monospace, monospace";
+        ctx.textAlign = "left";
+        ctx.fillText(SPELLS[i].name.slice(0, 6), sxp + 4, by + 74);
+      }
+    }
+  }
+
+  function centerText(lines) {
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, H / 2 - 90, W, 40 + lines.length * 34);
+    ctx.textAlign = "center";
+    lines.forEach((ln, i) => {
+      ctx.fillStyle = i === 0 ? "#8ab4ff" : "#e8e8e8";
+      ctx.font = (i === 0 ? "bold 30px" : "15px") + " 'SF Mono', ui-monospace, monospace";
+      ctx.fillText(ln, W / 2, H / 2 - 52 + i * 32);
+    });
+  }
+
+  function drawSelect() {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#8ab4ff";
+    ctx.font = "bold 20px 'SF Mono', ui-monospace, monospace";
+    ctx.fillText("CHOOSE YOUR FIGHTER", W / 2, 70);
+
+    const cardW = 150, cardH = 170, gap = 24;
+    const totalW = NAMES.length * cardW + (NAMES.length - 1) * gap;
+    const x0 = (W - totalW) / 2;
+    NAMES.forEach((n, i) => {
+      const x = x0 + i * (cardW + gap);
+      const y = 130;
+      ctx.fillStyle = "#161a24";
+      ctx.fillRect(x, y, cardW, cardH);
+      ctx.fillStyle = CHARS[n].color;
+      ctx.fillRect(x + cardW / 2 - 22, y + 26, 44, 62);
+      ctx.fillStyle = CHARS[n].trim;
+      ctx.fillRect(x + cardW / 2 - 22, y + 68, 44, 20);
+      ctx.fillStyle = "#e8e8e8";
+      ctx.font = "13px 'SF Mono', ui-monospace, monospace";
+      ctx.fillText(n.toUpperCase(), x + cardW / 2, y + 118);
+
+      // selection markers
+      [0, 1].forEach((pi) => {
+        if (selectIdx[pi] === i) {
+          ctx.strokeStyle = pi === 0 ? "#ffd54a" : "#57d0ff";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x + 3 + pi * 3, y + 3 + pi * 3, cardW - 6 - pi * 6, cardH - 6 - pi * 6);
+          ctx.fillStyle = pi === 0 ? "#ffd54a" : "#57d0ff";
+          ctx.font = "11px 'SF Mono', ui-monospace, monospace";
+          ctx.fillText("P" + (pi + 1) + (selectLocked[pi] ? " ✓" : ""), x + cardW / 2, y + 140 + pi * 16);
+        }
+      });
+    });
+
+    ctx.fillStyle = "#8a92a2";
+    ctx.font = "12px 'SF Mono', ui-monospace, monospace";
+    ctx.fillText("P1: A / D move, F lock in" + (vsCPU ? "    (CPU picks at random)" : "     P2: ← / → move, . lock in"), W / 2, 350);
+    if (selectLocked[0] && selectLocked[1]) ctx.fillText("both locked — press F or . to fight", W / 2, 372);
+  }
+
+  // select-screen input (edge-triggered)
+  function handleSelectInput() {
+    if (justPressed.has(P1_KEYS.left)) selectIdx[0] = (selectIdx[0] + NAMES.length - 1) % NAMES.length;
+    if (justPressed.has(P1_KEYS.right)) selectIdx[0] = (selectIdx[0] + 1) % NAMES.length;
+    if (justPressed.has(P1_KEYS.atk)) selectLocked[0] = true;
+    if (vsCPU) {
+      if (selectLocked[0] && !selectLocked[1]) {
+        selectIdx[1] = Math.floor(Math.random() * NAMES.length);
+        selectLocked[1] = true;
+      }
+    } else {
+      if (justPressed.has(P2_KEYS.left)) selectIdx[1] = (selectIdx[1] + NAMES.length - 1) % NAMES.length;
+      if (justPressed.has(P2_KEYS.right)) selectIdx[1] = (selectIdx[1] + 1) % NAMES.length;
+      if (justPressed.has(P2_KEYS.atk)) selectLocked[1] = true;
+    }
+    if (selectLocked[0] && selectLocked[1] &&
+        (justPressed.has(P1_KEYS.atk) || justPressed.has(P2_KEYS.atk) || justPressed.has("Space"))) {
+      startFight();
+    }
+  }
+
+  function handleModeInput() {
+    if (justPressed.has("Digit1")) { vsCPU = true; state = "select"; }
+    if (justPressed.has("Digit2")) { vsCPU = false; state = "select"; }
+    if (justPressed.has("ArrowUp") || justPressed.has("KeyW")) vsCPU = true;
+    if (justPressed.has("ArrowDown") || justPressed.has("KeyS")) vsCPU = false;
+    if (justPressed.has("KeyF") || justPressed.has("Space") || justPressed.has("Enter")) state = "select";
+  }
+
+  // ---------- main loop ----------
+  function render() {
+    ctx.save();
+    if (shakeT > 0) ctx.translate((Math.random() - 0.5) * shakeT, (Math.random() - 0.5) * shakeT);
+
+    // backdrop
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#141a2e");
+    g.addColorStop(1, "#0a0a12");
+    ctx.fillStyle = g;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    if (state === "title") {
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#8ab4ff";
+      ctx.font = "bold 40px 'SF Mono', ui-monospace, monospace";
+      ctx.fillText("FIGHTER", W / 2, H / 2 - 20);
+      ctx.fillStyle = "#cfd6e4";
+      ctx.font = "14px 'SF Mono', ui-monospace, monospace";
+      ctx.fillText("Mario  ·  Luigi  ·  Zelda  ·  Link   +   D&D spells", W / 2, H / 2 + 16);
+      ctx.fillStyle = "#8a92a2";
+      ctx.fillText("press any key", W / 2, H / 2 + 54);
+    } else if (state === "mode") {
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#8ab4ff";
+      ctx.font = "bold 22px 'SF Mono', ui-monospace, monospace";
+      ctx.fillText("SELECT MODE", W / 2, 150);
+      ctx.font = "18px 'SF Mono', ui-monospace, monospace";
+      ctx.fillStyle = vsCPU ? "#ffd54a" : "#cfd6e4";
+      ctx.fillText((vsCPU ? "▸ " : "  ") + "1  VS CPU", W / 2, 230);
+      ctx.fillStyle = !vsCPU ? "#ffd54a" : "#cfd6e4";
+      ctx.fillText((!vsCPU ? "▸ " : "  ") + "2  VS PLAYER", W / 2, 266);
+      ctx.fillStyle = "#8a92a2";
+      ctx.font = "12px 'SF Mono', ui-monospace, monospace";
+      ctx.fillText("press 1 / 2  (or W/S then F)", W / 2, 320);
+    } else if (state === "select") {
+      drawSelect();
+    } else {
+      drawStage();
+      projectiles.forEach(drawProjectile);
+      for (const f of fighters) drawFighter(f);
+      particles.forEach((p) => {
+        ctx.globalAlpha = clamp(p.life / 20, 0, 1);
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+        ctx.globalAlpha = 1;
+      });
+      drawHUD();
+      if (state === "result") {
+        const w = fighters[winner];
+        centerText([(w ? w.name.toUpperCase() : "P" + (winner + 1)) + " WINS", "press any key"]);
+      }
+    }
+    ctx.restore();
+  }
+
+  function tick() {
+    frame++;
+    if (state === "mode") handleModeInput();
+    else if (state === "select") handleSelectInput();
+    else if (state === "fight") updateFight();
+    else if (state === "result") updateFight(); // let particles settle
+    justPressed.clear();
+  }
+
+  function loop() {
+    tick();
+    render();
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
+</script>
+</body>
+</html>
